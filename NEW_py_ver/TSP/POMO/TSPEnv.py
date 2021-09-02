@@ -50,7 +50,7 @@ class TSPEnv:
         self.selected_node_list = None
         # shape: (batch, pomo, 0~problem)
 
-    def load_problems(self, batch_size, aug_factor=1):
+    def load_problems(self, batch_size, aug_factor=2):
         self.batch_size = batch_size
 
         self.problems = get_random_problems(batch_size, self.problem_size)
