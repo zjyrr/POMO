@@ -2,13 +2,13 @@
 from dataclasses import dataclass
 import torch
 
-from TSProblemDef import get_random_problems, augment_xy_data_by_8_fold
+from TSProblemDef import get_random_problems, augment_xy_data_by_2_fold
 
 
 @dataclass
 class Reset_State:
     problems: torch.Tensor
-    # shape: (batch, problem, 2)
+    # shape: (batch, problem, 2, 128)
 
 
 @dataclass
@@ -39,7 +39,9 @@ class TSPEnv:
         # IDX.shape: (batch, pomo)
         self.problems = None
         # shape: (batch, node, node)
-
+        self.distance_matrix = None
+        # shape: (batch, node, node)
+        
         # Dynamic
         ####################################
         self.selected_count = None
@@ -52,12 +54,13 @@ class TSPEnv:
         self.batch_size = batch_size
 
         self.problems = get_random_problems(batch_size, self.problem_size)
-        # problems.shape: (batch, problem, 2)
+        self.distance_matrix = torch.rand(size=(self.batch_size, self.problem_size, self.problem_size))
+        # problems.shape: (batch, problem, 2, 128)
         if aug_factor > 1:
-            if aug_factor == 8:
-                self.batch_size = self.batch_size * 8
-                self.problems = augment_xy_data_by_8_fold(self.problems)
-                # shape: (8*batch, problem, 2)
+            if aug_factor == 2:
+                self.batch_size = self.batch_size * 2
+                self.problems = augment_xy_data_by_2_fold(self.problems)
+                # shape: (2*batch, problem, 2, 128)
             else:
                 raise NotImplementedError
 
@@ -110,18 +113,30 @@ class TSPEnv:
         return self.step_state, reward, done
 
     def _get_travel_distance(self):
-        gathering_index = self.selected_node_list.unsqueeze(3).expand(self.batch_size, -1, self.problem_size, 2)
-        # shape: (batch, pomo, problem, 2)
-        seq_expanded = self.problems[:, None, :, :].expand(self.batch_size, self.pomo_size, self.problem_size, 2)
+        # gathering_index = self.selected_node_list.unsqueeze(3).expand(self.batch_size, -1, self.problem_size, 2)
+        # # shape: (batch, pomo, problem, 2)
+        # seq_expanded = self.problems[:, None, :, :].expand(self.batch_size, self.pomo_size, self.problem_size, 2)
 
-        ordered_seq = seq_expanded.gather(dim=2, index=gathering_index)
-        # shape: (batch, pomo, problem, 2)
+        # ordered_seq = seq_expanded.gather(dim=2, index=gathering_index)
+        # # shape: (batch, pomo, problem, 2)
 
-        rolled_seq = ordered_seq.roll(dims=2, shifts=-1)
-        segment_lengths = ((ordered_seq-rolled_seq)**2).sum(3).sqrt()
+        # rolled_seq = ordered_seq.roll(dims=2, shifts=-1)
+        # segment_lengths = ((ordered_seq-rolled_seq)**2).sum(3).sqrt()
+        # # shape: (batch, pomo, problem)
+
+        # travel_distances = segment_lengths.sum(2)
+        # # shape: (batch, pomo)
+        
+        travel_distances = torch.zeros((self.batch_size, self.pomo_size))
+        ordered_seq = self.selected_node_list
         # shape: (batch, pomo, problem)
-
-        travel_distances = segment_lengths.sum(2)
-        # shape: (batch, pomo)
+        rolled_seq = ordered_seq.roll(dims=2, shifts=-1)
+        for i in range (self.batch_size):
+            for j in range (self.pomo_size):
+                for t in range (self.problem_size):
+                    node_s = ordered_seq[i][j][t]
+                    node_e = rolled_seq[i][j][t]
+                    travel_distances[i][j] += self.distance_matrix[i][node_s][node_e]
+        
         return travel_distances
 

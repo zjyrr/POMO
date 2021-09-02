@@ -12,13 +12,14 @@ class TSPModel(nn.Module):
 
         self.encoder = TSP_Encoder(**model_params)
         self.decoder = TSP_Decoder(**model_params)
-        self.encoded_nodes = None
+        self.encoded_nodes_a = None
+        self.encoded_nodes_b = None
         # shape: (batch, problem, EMBEDDING_DIM)
 
     def pre_forward(self, reset_state):
-        self.encoded_nodes = self.encoder(reset_state.problems)
+        self.encoded_nodes_a, self.encoded_nodes_b = self.encoder(reset_state.problems)
         # shape: (batch, problem, EMBEDDING_DIM)
-        self.decoder.set_kv(self.encoded_nodes)
+        self.decoder.set_kv(self.encoded_nodes_a, self.encoded_nodes_b)
 
     def forward(self, state):
         batch_size = state.BATCH_IDX.size(0)
@@ -28,12 +29,12 @@ class TSPModel(nn.Module):
             selected = torch.arange(pomo_size)[None, :].expand(batch_size, pomo_size)
             prob = torch.ones(size=(batch_size, pomo_size))
 
-            encoded_first_node = _get_encoding(self.encoded_nodes, selected)
+            encoded_first_node = _get_encoding(self.encoded_nodes_a, selected)
             # shape: (batch, pomo, embedding)
             self.decoder.set_q1(encoded_first_node)
 
         else:
-            encoded_last_node = _get_encoding(self.encoded_nodes, state.current_node)
+            encoded_last_node = _get_encoding(self.encoded_nodes_a, state.current_node)
             # shape: (batch, pomo, embedding)
             probs = self.decoder(encoded_last_node, ninf_mask=state.ninf_mask)
             # shape: (batch, pomo, problem)
@@ -84,20 +85,23 @@ class TSP_Encoder(nn.Module):
         embedding_dim = self.model_params['embedding_dim']
         encoder_layer_num = self.model_params['encoder_layer_num']
 
-        self.embedding = nn.Linear(2, embedding_dim)
+        self.embedding = nn.Linear(128, embedding_dim)
         self.layers = nn.ModuleList([EncoderLayer(**model_params) for _ in range(encoder_layer_num)])
 
     def forward(self, data):
-        # data.shape: (batch, problem, 2)
-
-        embedded_input = self.embedding(data)
+        # data.shape: (batch, problem, 2, 128)
+        data_a = torch.squeeze(data[:, :, [0], :])
+        data_b = torch.squeeze(data[:, :, [1], :])
+        embedded_input_a = self.embedding(data_a)
+        embedded_input_b = self.embedding(data_b)
         # shape: (batch, problem, embedding)
 
-        out = embedded_input
+        out_a = embedded_input_a
+        out_b = embedded_input_b
         for layer in self.layers:
-            out = layer(out)
+            out_a, out_b = layer(out_a, out_b)
 
-        return out
+        return out_a, out_b
 
 
 class EncoderLayer(nn.Module):
@@ -108,35 +112,48 @@ class EncoderLayer(nn.Module):
         head_num = self.model_params['head_num']
         qkv_dim = self.model_params['qkv_dim']
 
-        self.Wq = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
-        self.Wk = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
-        self.Wv = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
-        self.multi_head_combine = nn.Linear(head_num * qkv_dim, embedding_dim)
+        self.Wq_L = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
+        self.Wk_L = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
+        self.Wv_L = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
+        self.Wq_R = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
+        self.Wk_R = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
+        self.Wv_R = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
+        self.multi_head_combine_L = nn.Linear(head_num * qkv_dim, embedding_dim)
+        self.multi_head_combine_R = nn.Linear(head_num * qkv_dim, embedding_dim)
 
         self.addAndNormalization1 = Add_And_Normalization_Module(**model_params)
         self.feedForward = Feed_Forward_Module(**model_params)
         self.addAndNormalization2 = Add_And_Normalization_Module(**model_params)
 
-    def forward(self, input1):
+    def forward(self, inputa, inputb):
         # input.shape: (batch, problem, EMBEDDING_DIM)
         head_num = self.model_params['head_num']
 
-        q = reshape_by_heads(self.Wq(input1), head_num=head_num)
-        k = reshape_by_heads(self.Wk(input1), head_num=head_num)
-        v = reshape_by_heads(self.Wv(input1), head_num=head_num)
+        q_L = reshape_by_heads(self.Wq_L(inputa), head_num=head_num)
+        k_L = reshape_by_heads(self.Wk_L(inputb), head_num=head_num)
+        v_L = reshape_by_heads(self.Wv_L(inputb), head_num=head_num)
+        q_R = reshape_by_heads(self.Wq_L(inputb), head_num=head_num)
+        k_R = reshape_by_heads(self.Wk_L(inputa), head_num=head_num)
+        v_R = reshape_by_heads(self.Wv_L(inputa), head_num=head_num)
         # q shape: (batch, HEAD_NUM, problem, KEY_DIM)
 
-        out_concat = multi_head_attention(q, k, v)
+        out_concat_L = multi_head_attention(q_L, k_L, v_L)
+        out_concat_R = multi_head_attention(q_R, k_R, v_R)
         # shape: (batch, problem, HEAD_NUM*KEY_DIM)
 
-        multi_head_out = self.multi_head_combine(out_concat)
+        multi_head_out_L = self.multi_head_combine_L(out_concat_L)
+        multi_head_out_R = self.multi_head_combine_R(out_concat_R)
         # shape: (batch, problem, EMBEDDING_DIM)
 
-        out1 = self.addAndNormalization1(input1, multi_head_out)
-        out2 = self.feedForward(out1)
-        out3 = self.addAndNormalization2(out1, out2)
+        out1_L = self.addAndNormalization1(inputa, multi_head_out_L)
+        out2_L = self.feedForward(out1_L)
+        out3_L = self.addAndNormalization2(out1_L, out2_L)
 
-        return out3
+        out1_R = self.addAndNormalization1(inputa, multi_head_out_R)
+        out2_R = self.feedForward(out1_R)
+        out3_R = self.addAndNormalization2(out1_R, out2_R)
+
+        return out3_L, out3_R
         # shape: (batch, problem, EMBEDDING_DIM)
 
 
@@ -164,14 +181,14 @@ class TSP_Decoder(nn.Module):
         self.single_head_key = None  # saved, for single-head attention
         self.q_first = None  # saved q1, for multi-head attention
 
-    def set_kv(self, encoded_nodes):
+    def set_kv(self, encoded_nodes_a, encoded_nodes_b):
         # encoded_nodes.shape: (batch, problem, embedding)
         head_num = self.model_params['head_num']
 
-        self.k = reshape_by_heads(self.Wk(encoded_nodes), head_num=head_num)
-        self.v = reshape_by_heads(self.Wv(encoded_nodes), head_num=head_num)
+        self.k = reshape_by_heads(self.Wk(encoded_nodes_b), head_num=head_num)
+        self.v = reshape_by_heads(self.Wv(encoded_nodes_b), head_num=head_num)
         # shape: (batch, head_num, pomo, qkv_dim)
-        self.single_head_key = encoded_nodes.transpose(1, 2)
+        self.single_head_key = encoded_nodes_b.transpose(1, 2)
         # shape: (batch, embedding, problem)
 
     def set_q1(self, encoded_q1):
